@@ -1,72 +1,49 @@
 from flask import Flask, request, jsonify
-import json
-import os
 
 app = Flask(__name__)
 
-# --- VERİ DOSYASI ---
-DATA_FILE = "/home/leon/trx_goblin/app/users.json"
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump([], f)
+# Basit bellek içi kullanıcı listesi (sonra gerçek DB bağlarız)
+users = []
 
-
-def load_users():
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_users(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-
-# =========================================
-#   KULLANICI LİSTELEME  (ADMIN PANEL)
-# =========================================
-@app.route("/get_users", methods=["GET"])
-def get_users():
-    users = load_users()
-    return jsonify({"status": "ok", "users": users})
-
-
-# =========================================
-#   MINER İSTATİSTİK GÜNCELLEME
-# =========================================
-@app.route("/update_stats", methods=["POST"])
-def update_stats():
-    try:
-        data = request.get_json()
-        username = data["username"]
-        hashrate = data["hashrate"]
-        threads = data["threads"]
-
-        users = load_users()
-        found = False
-
-        for u in users:
-            if u["username"] == username:
-                u["last_hashrate"] = hashrate
-                u["threads"] = threads
-                found = True
-
-        if not found:
-            return jsonify({"status": "error", "message": "user not found"})
-
-        save_users(users)
-        return jsonify({"status": "ok"})
-
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-
-# =========================================
-#   ROOT TEST
-# =========================================
 @app.route("/")
 def home():
-    return "Goblin Server Çalışıyor!"
+    return "TRX Goblin Server Çalışıyor!"
 
+@app.route("/get_users", methods=["GET"])
+def get_users():
+    return jsonify(users)
+
+@app.route("/update_stats", methods=["POST"])
+def update_stats():
+    data = request.json
+
+    username = data.get("username")
+    hashrate = data.get("hashrate")
+    threads = data.get("threads")
+
+    if not username:
+        return jsonify({"error": "username missing"}), 400
+
+    # Kullanıcı var mı kontrol et
+    found = False
+    for u in users:
+        if u["username"] == username:
+            u["hashrate"] = hashrate
+            u["threads"] = threads
+            found = True
+            break
+
+    # Yoksa yeni ekle
+    if not found:
+        users.append({
+            "username": username,
+            "hashrate": hashrate,
+            "threads": threads
+        })
+
+    return jsonify({"status": "ok"})
+    
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=5000)
+
