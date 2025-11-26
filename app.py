@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import time
 import hashlib
+import traceback
 
 import psycopg2
 import psycopg2.extras
@@ -24,7 +25,6 @@ ONLINE_THRESHOLD = 60 * 2  # 2 dakika içinde ping geldiyse ONLINE say
 
 def get_conn():
     """Her istekte yeni bir Postgres bağlantısı aç."""
-    # İstersen sslmode eklenebilir ama pooler zaten TLS kullanıyor.
     return psycopg2.connect(DATABASE_URL)
 
 
@@ -33,7 +33,6 @@ def init_db():
     try:
         conn = get_conn()
     except Exception as e:
-        # İlk boot’ta Supabase kısa süre offline olabilir, o yüzden sadece logla
         print("[init_db] DB bağlantı hatası:", e)
         return
 
@@ -105,7 +104,7 @@ def home():
 # -------------------------------------------------
 @app.post("/register")
 def register():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
 
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
@@ -155,7 +154,7 @@ def register():
 # -------------------------------------------------
 @app.post("/login")
 def login():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
 
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
@@ -194,28 +193,52 @@ def login():
 # -------------------------------------------------
 # UPDATE_STATS
 # Body: { username, hashrate, threads, accepted_daily, trx_daily }
-# Tüm alanlar opsiyonel, sadece username zorunlu
 # -------------------------------------------------
 @app.post("/update_stats")
 def update_stats():
-    try:
-        data = request.json or {}
-    except Exception:
-        return jsonify({"error": "invalid_json"}), 400
-
-    username = (data.get("username") or "").strip()
-    if not username:
-        return jsonify({"error": "username_missing"}), 400
-
-    hashrate = data.get("hashrate")
-    threads = data.get("threads")
-    accepted_daily = data.get("accepted_daily")
-    trx_daily = data.get("trx_daily")
-
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = None
+    cur = None
 
     try:
+        data = request.get_json(silent=True)
+        print("[update_stats] RAW PAYLOAD:", repr(data))
+
+        # JSON dict değilse (string, liste vs) 400 dön
+        if not isinstance(data, dict):
+            return jsonify({
+                "error": "invalid_payload",
+                "detail": "JSON dict bekleniyordu"
+            }), 400
+
+        username = str(data.get("username") or "").strip()
+        if not username:
+            return jsonify({"error": "username_missing"}), 400
+
+        # Güvenli parse helper'ları
+        def safe_float(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        def safe_int(v):
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
+
+        hashrate = safe_float(data.get("hashrate"))
+        threads = safe_int(data.get("threads"))
+        accepted_daily = safe_int(data.get("accepted_daily"))
+        trx_daily = safe_float(data.get("trx_daily"))
+
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
         # kullanıcı var mı?
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         row = cur.fetchone()
@@ -227,36 +250,46 @@ def update_stats():
 
         if hashrate is not None:
             fields.append("hashrate = %s")
-            params.append(float(hashrate))
+            params.append(hashrate)
 
         if threads is not None:
             fields.append("threads = %s")
-            params.append(int(threads))
+            params.append(threads)
 
         if accepted_daily is not None:
             fields.append("accepted_daily = %s")
-            params.append(int(accepted_daily))
+            params.append(accepted_daily)
 
         if trx_daily is not None:
             fields.append("trx_daily = %s")
-            params.append(float(trx_daily))
+            params.append(trx_daily)
 
-        # last_seen her güncellemede yenilensin (mutlaka olsun ki SET kısmı boş kalmasın)
+        # last_seen her güncellemede yenilensin
         fields.append("last_seen = NOW()")
-
         params.append(row["id"])
 
-        sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
+        sql = "UPDATE users SET " + ", ".join(fields) + " WHERE id = %s"
         cur.execute(sql, params)
         conn.commit()
+
         return jsonify({"status": "ok"})
-    except Exception as e:
-        conn.rollback()
-        print("[update_stats] hata:", e)
-        return jsonify({"error": "server_error", "detail": str(e)}), 500
+
+    except Exception:
+        tb = traceback.format_exc()
+        print("[update_stats] FATAL hata:", tb)
+        return jsonify({"error": "server_error", "detail": tb}), 500
+
     finally:
-        cur.close()
-        conn.close()
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 
 # -------------------------------------------------
@@ -346,7 +379,6 @@ def admin_panel():
                 last_seen_str = f"{diff} sn önce"
             elif diff < 3600:
                 last_seen_str = f"{diff // 60} dk önce"
-                pass
             else:
                 last_seen_str = f"{diff // 3600} saat önce"
             online = diff < ONLINE_THRESHOLD
@@ -441,12 +473,3 @@ def admin_panel():
 if __name__ == "__main__":
     # Lokal test için:
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-
-
-
-
-
-
-
