@@ -9,14 +9,14 @@ import psycopg2.extras
 app = Flask(__name__)
 
 # -------------------------------------------------
-# Supabase Transaction Pooler bağlantısı
+# Supabase Postgres bağlantısı
+# Render'da Environment -> DATABASE_URL
+# ÖRNEK (transaction pooler):
+# postgresql://postgres.rqbuhsoiqhapbxrugdha:PAROLA@aws-1-eu-central-2.pooler.supabase.com:6543/postgres
 # -------------------------------------------------
-# Render env:
-#   DATABASE_URL = postgresql://postgres.rqbuhsoiqhapbxrugdha:ŞİFRE@aws-1-eu-central-2.pooler.supabase.com:6543/postgres
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    # Render'da env yanlışsa uygulama hiç başlamasın, hata net olsun
     raise RuntimeError("DATABASE_URL environment değişkeni yok! Render panelinden ekle.")
 
 ONLINE_THRESHOLD = 60 * 2  # 2 dakika içinde ping geldiyse ONLINE say
@@ -24,19 +24,23 @@ ONLINE_THRESHOLD = 60 * 2  # 2 dakika içinde ping geldiyse ONLINE say
 
 def get_conn():
     """Her istekte yeni bir Postgres bağlantısı aç."""
+    # İstersen sslmode eklenebilir ama pooler zaten TLS kullanıyor.
     return psycopg2.connect(DATABASE_URL)
 
 
-def init_db_safe():
-    """
-    users tablosu yoksa oluşturmaya çalış.
-    Hata olursa uygulamayı öldürme, sadece log bas.
-    Böylece Supabase kısa süre kapalıyken deploy tamamen çökmez.
-    """
+def init_db():
+    """users tablosu yoksa oluştur (varsa dokunmaz)."""
     try:
         conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
+    except Exception as e:
+        # İlk boot’ta Supabase kısa süre offline olabilir, o yüzden sadece logla
+        print("[init_db] DB bağlantı hatası:", e)
+        return
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
@@ -49,47 +53,50 @@ def init_db_safe():
                 trx_daily DOUBLE PRECISION DEFAULT 0,
                 last_seen TIMESTAMPTZ
             );
-        """)
-        cur.execute("""
+            """
+        )
+        cur.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_users_username
             ON users (username);
-        """)
+            """
+        )
         conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print("[init_db] tablo oluşturma hatası:", e)
+    finally:
         cur.close()
         conn.close()
-        print("[init_db] users tablosu OK")
-    except Exception as e:
-        # Sadece logla, uygulama ayakta kalsın
-        print(f"[init_db] HATA ama uygulamayı durdurmuyorum: {e}")
 
 
-# Uygulama ayağa kalkarken tabloyu garantiye al (hata öldürmez)
-init_db_safe()
+# Uygulama ayağa kalkarken tabloyu garantiye al
+init_db()
 
 # -------------------------------------------------
-# Basit healthcheck endpoint
+# HEALTH CHECK
 # -------------------------------------------------
-@app.get("/")
-def home():
-    return "TRX Goblin Supabase Server Çalışıyor!"
-
-
 @app.get("/health_db")
 def health_db():
-    """
-    Supabase'e bağlanmayı test etmek için:
-    curl https://trx-goblin-server.onrender.com/health_db
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT NOW();")
-        row = cur.fetchone()
+        now = cur.fetchone()[0]
         cur.close()
         conn.close()
-        return jsonify({"ok": True, "now": str(row[0])})
+        return jsonify({"ok": True, "now": str(now)})
     except Exception as e:
+        print("[health_db] hata:", e)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# -------------------------------------------------
+# KÖK
+# -------------------------------------------------
+@app.get("/")
+def home():
+    return "TRX Goblin Supabase Server Çalışıyor!"
 
 
 # -------------------------------------------------
@@ -108,31 +115,37 @@ def register():
     if not username or not password or not email:
         return jsonify({"ok": False, "error": "missing_fields"}), 400
 
+    # Şifreyi SHA-256 ile hashle
     pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
 
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Kullanıcı var mı?
-    cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-    row = cur.fetchone()
-    if row:
+    try:
+        # Kullanıcı var mı?
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        if row:
+            return jsonify({"ok": False, "error": "user_exists"}), 409
+
+        # Yeni kullanıcı ekle
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, email, device_model, last_seen)
+            VALUES (%s, %s, %s, %s, NOW())
+            RETURNING id;
+            """,
+            (username, pw_hash, email, device_model),
+        )
+        conn.commit()
+        return jsonify({"ok": True}), 201
+    except Exception as e:
+        conn.rollback()
+        print("[register] hata:", e)
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+    finally:
         cur.close()
         conn.close()
-        return jsonify({"ok": False, "error": "user_exists"}), 409
-
-    # Yeni kullanıcı ekle
-    cur.execute("""
-        INSERT INTO users (username, password_hash, email, device_model, last_seen)
-        VALUES (%s, %s, %s, %s, NOW())
-        RETURNING id;
-    """, (username, pw_hash, email, device_model))
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-    return jsonify({"ok": True}), 201
 
 
 # -------------------------------------------------
@@ -155,34 +168,40 @@ def login():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute(
-        "SELECT id FROM users WHERE username = %s AND password_hash = %s",
-        (username, pw_hash)
-    )
-    row = cur.fetchone()
+    try:
+        cur.execute(
+            "SELECT id FROM users WHERE username = %s AND password_hash = %s",
+            (username, pw_hash),
+        )
+        row = cur.fetchone()
 
-    if not row:
+        if not row:
+            return jsonify({"ok": False}), 200
+
+        # login başarılı → last_seen güncelle
+        cur.execute("UPDATE users SET last_seen = NOW() WHERE id = %s", (row["id"],))
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.rollback()
+        print("[login] hata:", e)
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+    finally:
         cur.close()
         conn.close()
-        return jsonify({"ok": False}), 200
-
-    # login başarılı → last_seen güncelle
-    cur.execute("UPDATE users SET last_seen = NOW() WHERE id = %s", (row["id"],))
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-    return jsonify({"ok": True})
 
 
 # -------------------------------------------------
 # UPDATE_STATS
 # Body: { username, hashrate, threads, accepted_daily, trx_daily }
+# Tüm alanlar opsiyonel, sadece username zorunlu
 # -------------------------------------------------
 @app.post("/update_stats")
 def update_stats():
-    data = request.json or {}
+    try:
+        data = request.json or {}
+    except Exception:
+        return jsonify({"error": "invalid_json"}), 400
 
     username = (data.get("username") or "").strip()
     if not username:
@@ -196,44 +215,48 @@ def update_stats():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # kullanıcı var mı?
-    cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-    row = cur.fetchone()
-    if not row:
+    try:
+        # kullanıcı var mı?
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "user_not_found"}), 404
+
+        fields = []
+        params = []
+
+        if hashrate is not None:
+            fields.append("hashrate = %s")
+            params.append(float(hashrate))
+
+        if threads is not None:
+            fields.append("threads = %s")
+            params.append(int(threads))
+
+        if accepted_daily is not None:
+            fields.append("accepted_daily = %s")
+            params.append(int(accepted_daily))
+
+        if trx_daily is not None:
+            fields.append("trx_daily = %s")
+            params.append(float(trx_daily))
+
+        # last_seen her güncellemede yenilensin (mutlaka olsun ki SET kısmı boş kalmasın)
+        fields.append("last_seen = NOW()")
+
+        params.append(row["id"])
+
+        sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
+        cur.execute(sql, params)
+        conn.commit()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        conn.rollback()
+        print("[update_stats] hata:", e)
+        return jsonify({"error": "server_error", "detail": str(e)}), 500
+    finally:
         cur.close()
         conn.close()
-        return jsonify({"error": "user_not_found"}), 404
-
-    fields = []
-    params = []
-
-    if hashrate is not None:
-        fields.append("hashrate = %s")
-        params.append(hashrate)
-
-    if threads is not None:
-        fields.append("threads = %s")
-        params.append(threads)
-
-    if accepted_daily is not None:
-        fields.append("accepted_daily = %s")
-        params.append(accepted_daily)
-
-    if trx_daily is not None:
-        fields.append("trx_daily = %s")
-        params.append(trx_daily)
-
-    fields.append("last_seen = NOW()")
-    params.append(row["id"])
-
-    sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
-    cur.execute(sql, params)
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "ok"})
 
 
 # -------------------------------------------------
@@ -244,16 +267,19 @@ def get_users():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("""
-        SELECT id, username, email, device_model, password_hash,
-               hashrate, threads, accepted_daily, trx_daily, last_seen
-        FROM users
-        ORDER BY id ASC;
-    """)
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
+    try:
+        cur.execute(
+            """
+            SELECT id, username, email, device_model, password_hash,
+                   hashrate, threads, accepted_daily, trx_daily, last_seen
+            FROM users
+            ORDER BY id ASC;
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
     now_ts = time.time()
     result = []
@@ -268,18 +294,20 @@ def get_users():
             last_seen_ts = None
             online = False
 
-        result.append({
-            "username": u.get("username"),
-            "email": u.get("email"),
-            "device_model": u.get("device_model"),
-            "password_hash": u.get("password_hash"),
-            "hashrate": float(u.get("hashrate") or 0.0),
-            "threads": int(u.get("threads") or 0),
-            "accepted_daily": int(u.get("accepted_daily") or 0),
-            "trx_daily": float(u.get("trx_daily") or 0.0),
-            "online": online,
-            "last_seen": last_seen_ts,
-        })
+        result.append(
+            {
+                "username": u.get("username"),
+                "email": u.get("email"),
+                "device_model": u.get("device_model"),
+                "password_hash": u.get("password_hash"),
+                "hashrate": float(u.get("hashrate") or 0.0),
+                "threads": int(u.get("threads") or 0),
+                "accepted_daily": int(u.get("accepted_daily") or 0),
+                "trx_daily": float(u.get("trx_daily") or 0.0),
+                "online": online,
+                "last_seen": last_seen_ts,
+            }
+        )
 
     return jsonify(result)
 
@@ -292,16 +320,19 @@ def admin_panel():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    cur.execute("""
-        SELECT id, username, email, device_model, password_hash,
-               hashrate, threads, accepted_daily, trx_daily, last_seen
-        FROM users
-        ORDER BY id ASC;
-    """)
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
+    try:
+        cur.execute(
+            """
+            SELECT id, username, email, device_model, password_hash,
+                   hashrate, threads, accepted_daily, trx_daily, last_seen
+            FROM users
+            ORDER BY id ASC;
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
     now_ts = time.time()
     rows_html = ""
@@ -315,6 +346,7 @@ def admin_panel():
                 last_seen_str = f"{diff} sn önce"
             elif diff < 3600:
                 last_seen_str = f"{diff // 60} dk önce"
+                pass
             else:
                 last_seen_str = f"{diff // 3600} saat önce"
             online = diff < ONLINE_THRESHOLD
@@ -403,10 +435,18 @@ def admin_panel():
     </body>
     </html>
     """
-
     return html
 
 
 if __name__ == "__main__":
     # Lokal test için:
     app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
+
+
+
+
+
+
