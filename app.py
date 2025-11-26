@@ -9,13 +9,14 @@ import psycopg2.extras
 app = Flask(__name__)
 
 # -------------------------------------------------
-# Supabase Postgres bağlantısı
+# Supabase Transaction Pooler bağlantısı
 # -------------------------------------------------
-# Render panelinde Environment -> DATABASE_URL
-# postgresql://postgres:ŞİFREN@db.....supabase.co:5432/postgres
+# Render env:
+#   DATABASE_URL = postgresql://postgres.rqbuhsoiqhapbxrugdha:ŞİFRE@aws-1-eu-central-2.pooler.supabase.com:6543/postgres
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
+    # Render'da env yanlışsa uygulama hiç başlamasın, hata net olsun
     raise RuntimeError("DATABASE_URL environment değişkeni yok! Render panelinden ekle.")
 
 ONLINE_THRESHOLD = 60 * 2  # 2 dakika içinde ping geldiyse ONLINE say
@@ -26,42 +27,69 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def init_db():
-    """users tablosu yoksa oluştur."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGSERIAL PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            email TEXT NOT NULL,
-            device_model TEXT,
-            hashrate DOUBLE PRECISION DEFAULT 0,
-            threads INTEGER DEFAULT 0,
-            accepted_daily INTEGER DEFAULT 0,
-            trx_daily DOUBLE PRECISION DEFAULT 0,
-            last_seen TIMESTAMPTZ
-        );
-    """)
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_users_username
-        ON users (username);
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+def init_db_safe():
+    """
+    users tablosu yoksa oluşturmaya çalış.
+    Hata olursa uygulamayı öldürme, sadece log bas.
+    Böylece Supabase kısa süre kapalıyken deploy tamamen çökmez.
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT NOT NULL,
+                device_model TEXT,
+                hashrate DOUBLE PRECISION DEFAULT 0,
+                threads INTEGER DEFAULT 0,
+                accepted_daily INTEGER DEFAULT 0,
+                trx_daily DOUBLE PRECISION DEFAULT 0,
+                last_seen TIMESTAMPTZ
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_users_username
+            ON users (username);
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[init_db] users tablosu OK")
+    except Exception as e:
+        # Sadece logla, uygulama ayakta kalsın
+        print(f"[init_db] HATA ama uygulamayı durdurmuyorum: {e}")
 
 
-# Uygulama ayağa kalkarken tabloyu garantiye al
-init_db()
+# Uygulama ayağa kalkarken tabloyu garantiye al (hata öldürmez)
+init_db_safe()
 
 # -------------------------------------------------
-# KÖK
+# Basit healthcheck endpoint
 # -------------------------------------------------
 @app.get("/")
 def home():
     return "TRX Goblin Supabase Server Çalışıyor!"
+
+
+@app.get("/health_db")
+def health_db():
+    """
+    Supabase'e bağlanmayı test etmek için:
+    curl https://trx-goblin-server.onrender.com/health_db
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT NOW();")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({"ok": True, "now": str(row[0])})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # -------------------------------------------------
@@ -80,7 +108,6 @@ def register():
     if not username or not password or not email:
         return jsonify({"ok": False, "error": "missing_fields"}), 400
 
-    # Şifreyi SHA-256 ile hashle
     pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
 
     conn = get_conn()
@@ -196,9 +223,7 @@ def update_stats():
         fields.append("trx_daily = %s")
         params.append(trx_daily)
 
-    # last_seen her güncellemede yenilensin
     fields.append("last_seen = NOW()")
-
     params.append(row["id"])
 
     sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
