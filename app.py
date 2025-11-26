@@ -7,6 +7,7 @@ import traceback
 import psycopg2
 import psycopg2.extras
 
+
 app = Flask(__name__)
 
 # -------------------------------------------------
@@ -15,8 +16,8 @@ app = Flask(__name__)
 # ÖRNEK (transaction pooler):
 # postgresql://postgres.rqbuhsoiqhapbxrugdha:PAROLA@aws-1-eu-central-2.pooler.supabase.com:6543/postgres
 # -------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment değişkeni yok! Render panelinden ekle.")
 
@@ -25,6 +26,7 @@ ONLINE_THRESHOLD = 60 * 2  # 2 dakika içinde ping geldiyse ONLINE say
 
 def get_conn():
     """Her istekte yeni bir Postgres bağlantısı aç."""
+    # İstersen sslmode eklenebilir ama pooler zaten TLS kullanıyor.
     return psycopg2.connect(DATABASE_URL)
 
 
@@ -33,6 +35,7 @@ def init_db():
     try:
         conn = get_conn()
     except Exception as e:
+        # İlk boot’ta Supabase kısa süre offline olabilir, o yüzden sadece logla
         print("[init_db] DB bağlantı hatası:", e)
         return
 
@@ -56,8 +59,7 @@ def init_db():
         )
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_users_username
-            ON users (username);
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
             """
         )
         conn.commit()
@@ -75,6 +77,8 @@ init_db()
 # -------------------------------------------------
 # HEALTH CHECK
 # -------------------------------------------------
+
+
 @app.get("/health_db")
 def health_db():
     try:
@@ -93,6 +97,8 @@ def health_db():
 # -------------------------------------------------
 # KÖK
 # -------------------------------------------------
+
+
 @app.get("/")
 def home():
     return "TRX Goblin Supabase Server Çalışıyor!"
@@ -102,10 +108,11 @@ def home():
 # REGISTER (kayıt ol)
 # Body: { username, password, email, device_model(optional) }
 # -------------------------------------------------
+
+
 @app.post("/register")
 def register():
-    data = request.get_json(silent=True) or {}
-
+    data = request.json or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     email = (data.get("email") or "").strip()
@@ -119,7 +126,6 @@ def register():
 
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     try:
         # Kullanıcı var mı?
         cur.execute("SELECT id FROM users WHERE username = %s", (username,))
@@ -152,10 +158,11 @@ def register():
 # Body: { username, password }
 # Cevap: { ok: True/False }
 # -------------------------------------------------
+
+
 @app.post("/login")
 def login():
-    data = request.get_json(silent=True) or {}
-
+    data = request.json or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
 
@@ -166,14 +173,12 @@ def login():
 
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     try:
         cur.execute(
             "SELECT id FROM users WHERE username = %s AND password_hash = %s",
             (username, pw_hash),
         )
         row = cur.fetchone()
-
         if not row:
             return jsonify({"ok": False}), 200
 
@@ -193,28 +198,37 @@ def login():
 # -------------------------------------------------
 # UPDATE_STATS
 # Body: { username, hashrate, threads, accepted_daily, trx_daily }
+# Tüm alanlar opsiyonel, sadece username zorunlu
 # -------------------------------------------------
+
+
 @app.post("/update_stats")
 def update_stats():
-    conn = None
-    cur = None
-
+    # Burada HER ŞEYİ try/except içine alıyoruz ki 500 çıkmasın
     try:
-        data = request.get_json(silent=True)
-        print("[update_stats] RAW PAYLOAD:", repr(data))
+        # Gelen JSON'u al
+        raw = request.get_json(silent=True)
+        print("[update_stats] RAW PAYLOAD:", repr(raw))
 
-        # JSON dict değilse (string, liste vs) 400 dön
-        if not isinstance(data, dict):
-            return jsonify({
-                "error": "invalid_payload",
-                "detail": "JSON dict bekleniyordu"
-            }), 400
+        # Eğer dict değilse (mesela float, liste vs geldiyse) hata döndür
+        if not isinstance(raw, dict):
+            return (
+                jsonify(
+                    {
+                        "error": "invalid_payload",
+                        "detail": "JSON dict bekleniyordu",
+                        "raw": raw,
+                    }
+                ),
+                400,
+            )
 
+        data = raw
         username = str(data.get("username") or "").strip()
         if not username:
             return jsonify({"error": "username_missing"}), 400
 
-        # Güvenli parse helper'ları
+        # Güvenli parse yardımcıları
         def safe_float(v):
             if v is None:
                 return None
@@ -238,73 +252,79 @@ def update_stats():
 
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            # kullanıcı var mı?
+            cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "user_not_found"}), 404
 
-        # kullanıcı var mı?
-        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-        row = cur.fetchone()
-        if not row:
-            return jsonify({"error": "user_not_found"}), 404
+            fields = []
+            params = []
 
-        fields = []
-        params = []
+            if hashrate is not None:
+                fields.append("hashrate = %s")
+                params.append(hashrate)
 
-        if hashrate is not None:
-            fields.append("hashrate = %s")
-            params.append(hashrate)
+            if threads is not None:
+                fields.append("threads = %s")
+                params.append(threads)
 
-        if threads is not None:
-            fields.append("threads = %s")
-            params.append(threads)
+            if accepted_daily is not None:
+                fields.append("accepted_daily = %s")
+                params.append(accepted_daily)
 
-        if accepted_daily is not None:
-            fields.append("accepted_daily = %s")
-            params.append(accepted_daily)
+            if trx_daily is not None:
+                fields.append("trx_daily = %s")
+                params.append(trx_daily)
 
-        if trx_daily is not None:
-            fields.append("trx_daily = %s")
-            params.append(trx_daily)
+            # En azından last_seen güncellensin
+            fields.append("last_seen = NOW()")
 
-        # last_seen her güncellemede yenilensin
-        fields.append("last_seen = NOW()")
-        params.append(row["id"])
+            # WHERE id = %s için
+            params.append(row["id"])
 
-        sql = "UPDATE users SET " + ", ".join(fields) + " WHERE id = %s"
-        cur.execute(sql, params)
-        conn.commit()
-
-        return jsonify({"status": "ok"})
-
-    except Exception:
+            sql = "UPDATE users SET " + ", ".join(fields) + " WHERE id = %s"
+            cur.execute(sql, params)
+            conn.commit()
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            conn.rollback()
+            tb = traceback.format_exc()
+            print("[update_stats] DB hatası:", tb)
+            return jsonify({"error": "server_error", "detail": tb}), 500
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
         tb = traceback.format_exc()
         print("[update_stats] FATAL hata:", tb)
-        return jsonify({"error": "server_error", "detail": tb}), 500
-
-    finally:
-        try:
-            if cur is not None:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
+        return jsonify({"error": "fatal_server_error", "detail": tb}), 500
 
 
 # -------------------------------------------------
 # GET_USERS (JSON) – Admin API
 # -------------------------------------------------
+
+
 @app.get("/get_users")
 def get_users():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     try:
         cur.execute(
             """
-            SELECT id, username, email, device_model, password_hash,
-                   hashrate, threads, accepted_daily, trx_daily, last_seen
+            SELECT
+                id,
+                username,
+                email,
+                device_model,
+                password_hash,
+                hashrate,
+                threads,
+                accepted_daily,
+                trx_daily,
+                last_seen
             FROM users
             ORDER BY id ASC;
             """
@@ -348,16 +368,26 @@ def get_users():
 # -------------------------------------------------
 # HTML ADMIN PANEL (/admin)
 # -------------------------------------------------
+
+
 @app.get("/admin")
 def admin_panel():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     try:
         cur.execute(
             """
-            SELECT id, username, email, device_model, password_hash,
-                   hashrate, threads, accepted_daily, trx_daily, last_seen
+            SELECT
+                id,
+                username,
+                email,
+                device_model,
+                password_hash,
+                hashrate,
+                threads,
+                accepted_daily,
+                trx_daily,
+                last_seen
             FROM users
             ORDER BY id ASC;
             """
@@ -379,6 +409,7 @@ def admin_panel():
                 last_seen_str = f"{diff} sn önce"
             elif diff < 3600:
                 last_seen_str = f"{diff // 60} dk önce"
+                pass
             else:
                 last_seen_str = f"{diff // 3600} saat önce"
             online = diff < ONLINE_THRESHOLD
